@@ -1,4 +1,4 @@
-let gameTitles = ['Evil Dead: The Game']; // ← fill this with your list of game titles
+let gameTitles = ["Evil Dead: The Game", "Tomb Raider I-III Remastered Starring Lara Croft"]; // ← fill this with your list of game titles
 
 const DEFAULT_ACTION_DELAY_MS = 4000;
 const SEARCH_DELAY_MS = DEFAULT_ACTION_DELAY_MS;
@@ -7,6 +7,8 @@ const PANEL_POLL_INTERVAL_MS = 500;
 const EPIC_CHIP_SWITCH_DELAY_MS = 3500;
 const MENU_OPEN_DELAY_MS = 1000;
 const STORE_SWITCH_SETTLE_DELAY_MS = 2000;
+const SYNC_TIMEOUT_MS = 60000;    // Steam/Epic resync took ~8 s in testing; allow headroom
+const DIALOG_CLOSE_TIMEOUT_MS = 15000;
 
 let stopFlag = false;
 
@@ -172,10 +174,10 @@ let gfn = {
         
         const possibleElements = Array.from(document.querySelectorAll("[class*='chip'], button, a"));
         
-        epicChipEl = possibleElements.find(c => /epic/i.test(c.textContent) && isVisible(c) && !c.classList.contains('more-actions-button'));
+        epicChipEl = possibleElements.find(c => /epic/i.test(c.textContent) && (c) && !c.classList.contains('more-actions-button'));
         
         moreBtn = document.querySelector("gfn-game-details-actions button.more-actions-button") || 
-                  possibleElements.find(b => ["⋮", "MORE", "ACTIONS"].some(k => (b.innerText || b.textContent).toUpperCase().includes(k)) && isVisible(b));
+                  possibleElements.find(b => ["⋮", "MORE", "ACTIONS"].some(k => (b.innerText || b.textContent).toUpperCase().includes(k)) && (b));
         
         if (epicChipEl || moreBtn) break;
         await new Promise(r => setTimeout(r, PANEL_POLL_INTERVAL_MS));
@@ -206,7 +208,7 @@ let gfn = {
         let menus = Array.from(document.querySelectorAll("button, mat-mdc-menu-item, [role='menuitem'], span"));
         
         // Scenario A: "Epic" is immediately visible in the dropdown
-        let epicOption = menus.find(b => /epic/i.test((b.innerText || b.textContent)) && isVisible(b));
+        let epicOption = menus.find(b => /epic/i.test((b.innerText || b.textContent)) && (b));
         
         if (epicOption) {
              // Find the actual clickable parent if it grabbed a span
@@ -276,31 +278,82 @@ let gfn = {
     addBtn.click();
     console.log(`[GFN] 🟢 Clicked Add/Mark Owned for "${title}"`);
 
-    console.log(`[GFN] ⏳ Waiting for confirmation dialog...`);
-    let confirmBtn = null;
-    
-    // 4. Poll for Confirmation
-    for(let i=0; i<10; i++){
-        if(stopFlag) return;
-        const elements = Array.from(document.querySelectorAll("button, gfn-button, .mat-mdc-button"));
-        confirmBtn = elements.find(b => {
-            if(!isVisible(b)) return false;
-            const text = (b.innerText || b.textContent).toUpperCase().replace(/\s+/g, " ").trim();
-            return ["YES", "CONFIRM", "CONTINUE"].some(k => text.includes(k));
-        });
-        if(confirmBtn) break;
-        await new Promise(r => setTimeout(r, PANEL_POLL_INTERVAL_MS));
+        console.log(`[GFN] ⏳ Waiting for ownership dialog (store resync)...`);
+
+    // 4a. Wait for the resync to finish. The dialog (gfn-ownership-dialog) shows
+    //     "Finding where you own this game" first, then one of:
+    //       - "Choose a game store" with button.platform-option entries
+    //       - "Mark as owned" with CONTINUE / EXIT buttons
+    let dialog = null, epicOption = null, continueBtn = null;
+    const deadline = Date.now() + SYNC_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (stopFlag) return;
+      dialog = document.querySelector("gfn-ownership-dialog");
+      if (dialog) {
+        epicOption = Array.from(dialog.querySelectorAll("button.platform-option"))
+          .find(b => isVisible(b) && /epic/i.test(b.getAttribute("aria-label") || b.textContent));
+        continueBtn = Array.from(dialog.querySelectorAll("button"))
+          .find(b => isVisible(b) && btnText(b) === "CONTINUE");
+        if (epicOption || continueBtn) break;
+      }
+      await sleep(PANEL_POLL_INTERVAL_MS);
     }
-    
-    if (confirmBtn) {
-      confirmBtn.click();
-      console.log(`[GFN] ✅ Marked as owned: "${title}"`);
-      syncedGames.push(title);
-    } else {
-      console.warn(`[GFN] ❌ Confirm dialog missing for "${title}"`);
+
+    if (!dialog || (!epicOption && !continueBtn)) {
+      console.warn(`[GFN] ❌ Ownership dialog never reached store selection for "${title}"`);
       skippedGames.push(title);
+      dialog?.querySelector("button[aria-label='CLOSE']")?.click();
+      return setTimeout(() => this.searchNext(), CONFIRM_DELAY_MS);
     }
-    
+
+    // 4b. Pick Epic Games Store, then wait for the CONTINUE step
+    if (epicOption) {
+      epicOption.click();
+      console.log(`[GFN] ▶️ Selected Epic Games Store`);
+      continueBtn = null;
+      for (let i = 0; i < 20 && !continueBtn; i++) {
+        if (stopFlag) return;
+        await sleep(PANEL_POLL_INTERVAL_MS);
+        continueBtn = Array.from(document.querySelectorAll("gfn-ownership-dialog button"))
+          .find(b => isVisible(b) && btnText(b) === "CONTINUE");
+      }
+    }
+
+    if (!continueBtn) {
+      console.warn(`[GFN] ❌ CONTINUE button missing for "${title}"`);
+      skippedGames.push(title);
+      document.querySelector("gfn-ownership-dialog button[aria-label='CLOSE']")?.click();
+      return setTimeout(() => this.searchNext(), CONFIRM_DELAY_MS);
+    }
+
+    // Guard: make sure the dialog header names Epic, not another store
+    const header = document.querySelector("gfn-ownership-dialog")?.textContent || "";
+    if (!/epic games store/i.test(header)) {
+      console.warn(`[GFN] ⚠ Dialog does not show Epic Games Store for "${title}" — skipping`);
+      skippedGames.push(title);
+      document.querySelector("gfn-ownership-dialog button[aria-label='CLOSE']")?.click();
+      return setTimeout(() => this.searchNext(), CONFIRM_DELAY_MS);
+    }
+
+    // 4c. Confirm
+    continueBtn.click();
+    console.log(`[GFN] 🟢 Clicked CONTINUE for "${title}"`);
+
+    // 4d. Wait for the dialog to close; if it stays open (e.g. a final
+    //     "done" screen), dismiss it with the CLOSE (X) button
+    const closeDeadline = Date.now() + DIALOG_CLOSE_TIMEOUT_MS;
+    while (Date.now() < closeDeadline && document.querySelector("gfn-ownership-dialog")) {
+      if (stopFlag) return;
+      await sleep(PANEL_POLL_INTERVAL_MS);
+    }
+    const leftover = document.querySelector("gfn-ownership-dialog");
+    if (leftover) {
+      console.log(`[GFN] ℹ️ Dialog still open after CONTINUE — closing it`);
+      leftover.querySelector("button[aria-label='CLOSE']")?.click();
+    }
+
+    console.log(`[GFN] ✅ Marked as owned: "${title}"`);
+    syncedGames.push(title);
     setTimeout(() => this.searchNext(), CONFIRM_DELAY_MS);
   },
 
