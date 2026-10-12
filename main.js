@@ -350,6 +350,9 @@ let gfn = {
     const closeDeadline = Date.now() + DIALOG_CLOSE_TIMEOUT_MS;
     while (Date.now() < closeDeadline && document.querySelector("gfn-ownership-dialog")) {
       if (stopFlag) return;
+       [...document.querySelectorAll("gfn-ownership-dialog .button-label")]
+        .find(s => s.textContent.trim() === "Done")
+        ?.closest("button").click();
       await sleep(PANEL_POLL_INTERVAL_MS);
     }
     const leftover = document.querySelector("gfn-ownership-dialog");
