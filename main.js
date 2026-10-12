@@ -16,8 +16,14 @@ const syncedGames    = [];
 const skippedGames   = [];
 const nameMismatches = [];
 
-// Helper: robust visibility check for animated elements
+// Helpers:
+// robust visibility check for animated elements
 const isVisible = (el) => el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+// sleep
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Finding Button Text
+const btnText = (b) => (b.innerText || b.textContent || "").toUpperCase().replace(/\s+/g, " ").trim();
+
 
 // Ctrl+C to cancel mid-run
 document.addEventListener("keydown", e => {
